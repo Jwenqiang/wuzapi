@@ -99,3 +99,42 @@ func TestDeleteKillChannelStaleSession(t *testing.T) {
 		t.Error("entry still present after deleteKillChannel with the current channel")
 	}
 }
+
+func TestOwnsKillChannelRejectsStaleSession(t *testing.T) {
+	const u = "stale-owner-user"
+
+	chA := make(chan bool, 1)
+	chB := make(chan bool, 1)
+	setKillChannel(u, chA)
+	if !ownsKillChannel(u, chA) {
+		t.Fatal("current session should own its kill channel")
+	}
+
+	setKillChannel(u, chB)
+	if ownsKillChannel(u, chA) {
+		t.Fatal("stale session must not own the replacement kill channel")
+	}
+	if !ownsKillChannel(u, chB) {
+		t.Fatal("replacement session should own its kill channel")
+	}
+
+	deleteKillChannel(u, chB)
+}
+
+func TestOwnsLoginSessionRejectsStaleEvent(t *testing.T) {
+	const u = "stale-login-event-user"
+
+	chA := make(chan bool, 1)
+	chB := make(chan bool, 1)
+	setKillChannel(u, chA)
+	if !ownsLoginSession(u, chA, "QRTimeout") {
+		t.Fatal("current login session should handle its own event")
+	}
+
+	setKillChannel(u, chB)
+	if ownsLoginSession(u, chA, "QRTimeout") {
+		t.Fatal("stale login session event must be ignored before cleanup or disconnect")
+	}
+
+	deleteKillChannel(u, chB)
+}

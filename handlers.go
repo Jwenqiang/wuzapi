@@ -763,11 +763,51 @@ func (s *server) GetStatus() http.HandlerFunc {
 
 		txtid := userInfo.Get("Id")
 
-		isConnected := clientManager.GetWhatsmeowClient(txtid).IsConnected()
-		isLoggedIn := clientManager.GetWhatsmeowClient(txtid).IsLoggedIn()
+		client := clientManager.GetWhatsmeowClient(txtid)
+		isConnected := false
+		isLoggedIn := false
+		if client != nil {
+			isConnected = client.IsConnected()
+			isLoggedIn = client.IsLoggedIn()
+		}
 
-		var proxyURL string
-		s.db.QueryRow("SELECT proxy_url FROM users WHERE id = $1", txtid).Scan(&proxyURL)
+		jid := userInfo.Get("Jid")
+		qrcode := userInfo.Get("Qrcode")
+		proxyURL := userInfo.Get("Proxy")
+		cacheValue := interface{}(userInfo)
+		cacheChanged := false
+
+		var dbJid, dbQrcode, dbProxyURL string
+		if err := s.db.QueryRow("SELECT COALESCE(jid, ''), COALESCE(qrcode, ''), COALESCE(proxy_url, '') FROM users WHERE id = $1", txtid).Scan(&dbJid, &dbQrcode, &dbProxyURL); err == nil {
+			jid = dbJid
+			qrcode = dbQrcode
+			proxyURL = dbProxyURL
+		} else if err != sql.ErrNoRows {
+			log.Warn().Err(err).Str("userID", txtid).Msg("Failed to refresh user status fields from database")
+		}
+
+		if jid == "" && client != nil && client.Store != nil && client.Store.ID != nil {
+			jid = client.Store.ID.String()
+			if _, err := s.db.Exec("UPDATE users SET jid=$1 WHERE id=$2", jid, txtid); err != nil {
+				log.Warn().Err(err).Str("userID", txtid).Str("jid", jid).Msg("Failed to backfill jid from active WhatsApp client")
+			}
+		}
+
+		if jid != userInfo.Get("Jid") {
+			cacheValue = updateUserInfo(cacheValue, "Jid", jid)
+			cacheChanged = true
+		}
+		if qrcode != userInfo.Get("Qrcode") {
+			cacheValue = updateUserInfo(cacheValue, "Qrcode", qrcode)
+			cacheChanged = true
+		}
+		if proxyURL != userInfo.Get("Proxy") {
+			cacheValue = updateUserInfo(cacheValue, "Proxy", proxyURL)
+			cacheChanged = true
+		}
+		if cacheChanged {
+			userinfocache.Set(userInfo.Get("Token"), cacheValue, cache.NoExpiration)
+		}
 		proxyConfig := map[string]interface{}{
 			"enabled":   proxyURL != "",
 			"proxy_url": proxyURL,
@@ -821,11 +861,11 @@ func (s *server) GetStatus() http.HandlerFunc {
 			"connected":       isConnected,
 			"loggedIn":        isLoggedIn,
 			"token":           userInfo.Get("Token"),
-			"jid":             userInfo.Get("Jid"),
+			"jid":             jid,
 			"webhook":         userInfo.Get("Webhook"),
 			"events":          userInfo.Get("Events"),
-			"proxy_url":       userInfo.Get("Proxy"),
-			"qrcode":          userInfo.Get("Qrcode"),
+			"proxy_url":       proxyURL,
+			"qrcode":          qrcode,
 			"history":         userInfo.Get("History"),
 			"proxy_config":    proxyConfig,
 			"s3_config":       s3Config,

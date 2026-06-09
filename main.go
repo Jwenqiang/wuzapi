@@ -102,6 +102,19 @@ func getKillChannel(userID string) (chan bool, bool) {
 	return ch, ok
 }
 
+func ownsKillChannel(userID string, ch chan bool) bool {
+	current, ok := getKillChannel(userID)
+	return ok && current == ch
+}
+
+func ownsLoginSession(userID string, ch chan bool, eventName string) bool {
+	if ownsKillChannel(userID, ch) {
+		return true
+	}
+	log.Info().Str("userid", userID).Str("event", eventName).Msg("Ignoring stale login session event")
+	return false
+}
+
 // deleteKillChannel removes userID's entry, but only if it still maps to ch.
 // A session goroutine passes the channel it captured at startup; if a newer
 // session has replaced the entry in the meantime (a reconnect for the same

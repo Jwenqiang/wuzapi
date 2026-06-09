@@ -551,6 +551,10 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 					sendEventWithWebHook(&mycli, postmap, "")
 
 				} else if evt.Event == "timeout" {
+					if !ownsLoginSession(userID, kill, "QRTimeout") {
+						return
+					}
+
 					// Clear QR code from DB on timeout
 					// Send webhook notifying QR timeout before cleanup
 					postmap := make(map[string]interface{})
@@ -558,7 +562,7 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 					postmap["type"] = "QRTimeout"
 					sendEventWithWebHook(&mycli, postmap, "")
 
-					sqlStmt := `UPDATE users SET qrcode='' WHERE id=$1`
+					sqlStmt := `UPDATE users SET qrcode='', connected=0 WHERE id=$1`
 					_, err := s.db.Exec(sqlStmt, userID)
 					if err != nil {
 						log.Error().Err(err).Msg(sqlStmt)
@@ -568,11 +572,13 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 							userinfocache.Set(token, v, cache.NoExpiration)
 						}
 					}
-					log.Warn().Msg("QR timeout killing channel")
+					log.Warn().Msg("QR timeout cleaning current login session")
+					client.Disconnect()
 					clientManager.DeleteWhatsmeowClient(userID)
 					clientManager.DeleteMyClient(userID)
 					clientManager.DeleteHTTPClient(userID)
-					signalKill(userID)
+					deleteKillChannel(userID, kill)
+					return
 				} else if evt.Event == "success" {
 					log.Info().Msg("QR pairing ok!")
 					// Clear QR code after pairing
@@ -586,6 +592,7 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 							userinfocache.Set(token, v, cache.NoExpiration)
 						}
 					}
+					break
 				} else {
 					log.Info().Str("event", evt.Event).Msg("Login event")
 				}
@@ -662,6 +669,10 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 	// the goroutine with zero CPU and no per-second mutex access.
 	<-kill
 	log.Info().Str("userid", userID).Msg("Received kill signal")
+	if !ownsLoginSession(userID, kill, "Kill") {
+		return
+	}
+
 	client.Disconnect()
 	clientManager.DeleteWhatsmeowClient(userID)
 	clientManager.DeleteMyClient(userID)
@@ -913,24 +924,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 			}
 		}
-    
-    if encMessage := evt.Message.GetSecretEncryptedMessage(); encMessage != nil {
-        decrypted, derr := mycli.WAClient.DecryptSecretEncryptedMessage(context.Background(), evt)
-        if derr != nil {
-            log.Warn().
-                Err(derr).
-                Str("messageID", evt.Info.ID).
-                Str("secretEncType", encMessage.GetSecretEncType().String()).
-                Msg("DecryptSecretEncryptedMessage failed")
-        } else if decrypted != nil {
-            log.Info().
-                Str("messageID", evt.Info.ID).
-                Str("secretEncType", encMessage.GetSecretEncType().String()).
-                Msg("Decrypted secretEncryptedMessage; swapping evt.Message")
-                evt.Message = decrypted
-        }
-    }
-    
+
+		if encMessage := evt.Message.GetSecretEncryptedMessage(); encMessage != nil {
+			decrypted, derr := mycli.WAClient.DecryptSecretEncryptedMessage(context.Background(), evt)
+			if derr != nil {
+				log.Warn().
+					Err(derr).
+					Str("messageID", evt.Info.ID).
+					Str("secretEncType", encMessage.GetSecretEncType().String()).
+					Msg("DecryptSecretEncryptedMessage failed")
+			} else if decrypted != nil {
+				log.Info().
+					Str("messageID", evt.Info.ID).
+					Str("secretEncType", encMessage.GetSecretEncType().String()).
+					Msg("Decrypted secretEncryptedMessage; swapping evt.Message")
+				evt.Message = decrypted
+			}
+		}
+
 		if !*skipMedia {
 
 			isIncoming := !evt.Info.IsFromMe
