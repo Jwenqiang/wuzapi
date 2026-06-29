@@ -89,6 +89,21 @@ func (cm *ClientManager) DeleteMyClient(userID string) {
 	delete(cm.pollOptions, userID)
 }
 
+func (cm *ClientManager) DeleteSessionIfCurrent(userID string, waClient *whatsmeow.Client, myClient *MyClient, httpClient *resty.Client) {
+	cm.Lock()
+	defer cm.Unlock()
+	if current, ok := cm.whatsmeowClients[userID]; ok && current == waClient {
+		delete(cm.whatsmeowClients, userID)
+	}
+	if current, ok := cm.myClients[userID]; ok && current == myClient {
+		delete(cm.myClients, userID)
+		delete(cm.pollOptions, userID)
+	}
+	if current, ok := cm.httpClients[userID]; ok && current == httpClient {
+		delete(cm.httpClients, userID)
+	}
+}
+
 // SetPollOptions remembers the plaintext options of a poll we just sent so
 // that incoming votes (which arrive as SHA-256 hashes of the option text)
 // can be resolved back to readable strings.

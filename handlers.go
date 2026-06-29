@@ -238,14 +238,25 @@ func resolveConnectEvents(subscribe []string, existing string) (eventstring stri
 	return resolved, resolved != existing
 }
 
-// setDisconnectedState marks a user disconnected. Event subscriptions are kept
-// by default and only reset when clearEvents is true (issue #305).
+func isBenignSessionStateError(err string) bool {
+	switch strings.ToLower(strings.TrimSpace(err)) {
+	case "already connected", "already logged in", "no session", "cannot disconnect because it is not logged in":
+		return true
+	default:
+		return false
+	}
+}
+
+// setDisconnectedState stops an active websocket/login attempt. Event
+// subscriptions are kept by default and only reset when clearEvents is true
+// (issue #305). A completed QR pair has a JID and must keep its authorized
+// state even if a reconnect cleanup arrives just after PairSuccess.
 func (s *server) setDisconnectedState(txtid string, clearEvents bool) error {
 	if clearEvents {
 		_, err := s.db.Exec("UPDATE users SET connected=0,events=$1 WHERE id=$2", "", txtid)
 		return err
 	}
-	_, err := s.db.Exec("UPDATE users SET connected=0 WHERE id=$1", txtid)
+	_, err := s.db.Exec("UPDATE users SET qrcode='', connected=CASE WHEN COALESCE(jid, '') <> '' THEN connected ELSE 0 END WHERE id=$1", txtid)
 	return err
 }
 
@@ -263,7 +274,8 @@ func (s *server) Connect() http.HandlerFunc {
 		jid := r.Context().Value("userinfo").(Values).Get("Jid")
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 		token := r.Context().Value("userinfo").(Values).Get("Token")
-		eventstring := ""
+		existingEvents := r.Context().Value("userinfo").(Values).Get("Events")
+		eventstring := existingEvents
 
 		// Decodes request BODY looking for events to subscribe
 		decoder := json.NewDecoder(r.Body)
@@ -277,14 +289,19 @@ func (s *server) Connect() http.HandlerFunc {
 		if clientManager.GetWhatsmeowClient(txtid) != nil {
 			isConnected := clientManager.GetWhatsmeowClient(txtid).IsConnected()
 			if isConnected == true {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New("already connected"))
+				response := map[string]interface{}{"webhook": webhook, "jid": jid, "events": eventstring, "details": "Already connected"}
+				responseJson, err := json.Marshal(response)
+				if err != nil {
+					s.Respond(w, r, http.StatusInternalServerError, err)
+				} else {
+					s.Respond(w, r, http.StatusOK, string(responseJson))
+				}
 				return
 			}
 		}
 
 		// Resolve which events to subscribe. With no subscribe list, preserve the
 		// user's existing subscriptions instead of overwriting them (issue #305).
-		existingEvents := r.Context().Value("userinfo").(Values).Get("Events")
 		var changed bool
 		eventstring, changed = resolveConnectEvents(t.Subscribe, existingEvents)
 		if changed {
@@ -338,9 +355,19 @@ func (s *server) Disconnect() http.HandlerFunc {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 		jid := r.Context().Value("userinfo").(Values).Get("Jid")
 		token := r.Context().Value("userinfo").(Values).Get("Token")
+		clearEvents := r.URL.Query().Get("clear") == "true"
 
 		if clientManager.GetWhatsmeowClient(txtid) == nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			if err := s.setDisconnectedState(txtid, clearEvents); err != nil {
+				log.Warn().Str("txtid", txtid).Msg("Could not update users table on idempotent disconnect")
+			}
+			response := map[string]interface{}{"Details": "Disconnected"}
+			responseJson, err := json.Marshal(response)
+			if err != nil {
+				s.Respond(w, r, http.StatusInternalServerError, err)
+			} else {
+				s.Respond(w, r, http.StatusOK, string(responseJson))
+			}
 			return
 		}
 		if clientManager.GetWhatsmeowClient(txtid).IsConnected() == true {
@@ -348,7 +375,6 @@ func (s *server) Disconnect() http.HandlerFunc {
 			log.Info().Str("jid", jid).Msg("Disconnection successfull")
 			// Preserve event subscriptions by default; pass ?clear=true to also
 			// reset them on disconnect (issue #305).
-			clearEvents := r.URL.Query().Get("clear") == "true"
 			if err := s.setDisconnectedState(txtid, clearEvents); err != nil {
 				log.Warn().Str("txtid", txtid).Msg("Could not update users table on disconnect")
 			} else {
@@ -377,8 +403,19 @@ func (s *server) Disconnect() http.HandlerFunc {
 			//	return
 			//}
 		} else {
-			log.Warn().Str("jid", jid).Msg("Ignoring disconnect as it was not connected")
-			s.Respond(w, r, http.StatusInternalServerError, errors.New("cannot disconnect because it is not logged in"))
+			log.Warn().Str("jid", jid).Msg("Treating disconnect as successful because it was already not connected")
+			if err := s.setDisconnectedState(txtid, clearEvents); err != nil {
+				log.Warn().Str("txtid", txtid).Msg("Could not update users table on idempotent disconnect")
+			}
+			clientManager.DeleteWhatsmeowClient(txtid)
+			signalKill(txtid)
+			response := map[string]interface{}{"Details": "Disconnected"}
+			responseJson, err := json.Marshal(response)
+			if err != nil {
+				s.Respond(w, r, http.StatusInternalServerError, err)
+			} else {
+				s.Respond(w, r, http.StatusOK, string(responseJson))
+			}
 			return
 		}
 	}
@@ -598,6 +635,7 @@ func (s *server) GetQR() http.HandlerFunc {
 
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 		code := ""
+		jid := r.Context().Value("userinfo").(Values).Get("Jid")
 
 		if clientManager.GetWhatsmeowClient(txtid) == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
@@ -607,14 +645,14 @@ func (s *server) GetQR() http.HandlerFunc {
 				s.Respond(w, r, http.StatusInternalServerError, errors.New("not connected"))
 				return
 			}
-			rows, err := s.db.Query("SELECT qrcode AS code FROM users WHERE id=$1 LIMIT 1", txtid)
+			rows, err := s.db.Query("SELECT qrcode AS code, COALESCE(jid, '') AS jid FROM users WHERE id=$1 LIMIT 1", txtid)
 			if err != nil {
 				s.Respond(w, r, http.StatusInternalServerError, err)
 				return
 			}
 			defer rows.Close()
 			for rows.Next() {
-				err = rows.Scan(&code)
+				err = rows.Scan(&code, &jid)
 				if err != nil {
 					s.Respond(w, r, http.StatusInternalServerError, err)
 					return
@@ -626,7 +664,13 @@ func (s *server) GetQR() http.HandlerFunc {
 				return
 			}
 			if clientManager.GetWhatsmeowClient(txtid).IsLoggedIn() == true {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New("already logged in"))
+				response := map[string]interface{}{"QRCode": "", "LoggedIn": true, "JID": jid}
+				responseJson, err := json.Marshal(response)
+				if err != nil {
+					s.Respond(w, r, http.StatusInternalServerError, err)
+				} else {
+					s.Respond(w, r, http.StatusOK, string(responseJson))
+				}
 				return
 			}
 		}

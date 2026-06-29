@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -41,7 +42,27 @@ type MyClient struct {
 	token          string
 	db             *sqlx.DB
 	s              *server
+	loginKill      chan bool
+	qrPairMu       sync.Mutex
+	qrPairState    qrPairState
 }
+
+type qrPairState int
+
+const (
+	qrPairPending qrPairState = iota
+	qrPairAuthorized
+	qrPairTimedOut
+	qrPairStale
+)
+
+type qrTimeoutResult int
+
+const (
+	qrTimeoutIgnored qrTimeoutResult = iota
+	qrTimeoutApplied
+	qrTimeoutStaleSession
+)
 
 // safeGo runs fn in a new goroutine with a defer recover so a panic inside
 // fire-and-forget side-effects (webhook delivery, MQ push) cannot crash
@@ -60,6 +81,168 @@ func safeGo(name string, fn func()) {
 		}()
 		fn()
 	}()
+}
+
+func configureQRClientType(client *whatsmeow.Client) {
+	if client == nil {
+		return
+	}
+	client.QRClientType = whatsmeow.PairClientChrome
+}
+
+func (mycli *MyClient) hasPairSuccess() bool {
+	if mycli == nil {
+		return false
+	}
+	mycli.qrPairMu.Lock()
+	defer mycli.qrPairMu.Unlock()
+	return mycli.qrPairState == qrPairAuthorized
+}
+
+func (mycli *MyClient) updateCachedPairingState(jid string) {
+	myuserinfo, found := userinfocache.Get(mycli.token)
+	if !found {
+		log.Warn().Msg("No user info cached on pairing?")
+		return
+	}
+
+	token := myuserinfo.(Values).Get("Token")
+	if token == "" {
+		token = mycli.token
+	}
+	var v interface{} = myuserinfo
+	if jid != "" {
+		v = updateUserInfo(v, "Jid", jid)
+	}
+	v = updateUserInfo(v, "Qrcode", "")
+	userinfocache.Set(token, v, cache.NoExpiration)
+}
+
+func (mycli *MyClient) lockCurrentQRSession(expectedKill chan bool) (func(), bool) {
+	killchannelMu.Lock()
+	if expectedKill != nil {
+		if current, ok := killchannel[mycli.userID]; !ok || current != expectedKill {
+			mycli.qrPairMu.Lock()
+			if mycli.qrPairState == qrPairPending {
+				mycli.qrPairState = qrPairStale
+			}
+			mycli.qrPairMu.Unlock()
+			killchannelMu.Unlock()
+			return nil, false
+		}
+	}
+
+	mycli.qrPairMu.Lock()
+	return func() {
+		mycli.qrPairMu.Unlock()
+		killchannelMu.Unlock()
+	}, true
+}
+
+func (mycli *MyClient) markPairSuccess(jid types.JID) (bool, error) {
+	if mycli == nil || mycli.db == nil {
+		return false, errors.New("missing client or database for pair success")
+	}
+
+	unlock, current := mycli.lockCurrentQRSession(mycli.loginKill)
+	if !current {
+		return false, nil
+	}
+	defer unlock()
+	if mycli.qrPairState != qrPairPending {
+		return false, nil
+	}
+
+	sqlStmt := `UPDATE users SET jid=$1, qrcode='', connected=1 WHERE id=$2`
+	if _, err := mycli.db.Exec(sqlStmt, jid.String(), mycli.userID); err != nil {
+		return false, fmt.Errorf("%s: %w", sqlStmt, err)
+	}
+	mycli.qrPairState = qrPairAuthorized
+	mycli.updateCachedPairingState(jid.String())
+	log.Info().Str("jid", jid.String()).Str("userid", mycli.userID).Str("token", mycli.token).Msg("User information set")
+	return true, nil
+}
+
+func (mycli *MyClient) isQRPending() bool {
+	if mycli == nil {
+		return false
+	}
+	mycli.qrPairMu.Lock()
+	defer mycli.qrPairMu.Unlock()
+	return mycli.qrPairState == qrPairPending
+}
+
+func (mycli *MyClient) markQRChannelSuccess() error {
+	if mycli == nil || mycli.db == nil {
+		return errors.New("missing client or database for qr success")
+	}
+
+	unlock, current := mycli.lockCurrentQRSession(mycli.loginKill)
+	if !current {
+		return nil
+	}
+	defer unlock()
+	if mycli.qrPairState == qrPairTimedOut {
+		return nil
+	}
+
+	sqlStmt := `UPDATE users SET qrcode='' WHERE id=$1`
+	if _, err := mycli.db.Exec(sqlStmt, mycli.userID); err != nil {
+		return fmt.Errorf("%s: %w", sqlStmt, err)
+	}
+	mycli.updateCachedPairingState("")
+	return nil
+}
+
+func (mycli *MyClient) storeQRCode(base64qrcode string) (bool, error) {
+	if mycli == nil || mycli.db == nil {
+		return false, errors.New("missing client or database for qr code")
+	}
+
+	unlock, current := mycli.lockCurrentQRSession(mycli.loginKill)
+	if !current {
+		return false, nil
+	}
+	defer unlock()
+	if mycli.qrPairState != qrPairPending {
+		return false, nil
+	}
+
+	sqlStmt := `UPDATE users SET qrcode=$1 WHERE id=$2`
+	if _, err := mycli.db.Exec(sqlStmt, base64qrcode, mycli.userID); err != nil {
+		return false, fmt.Errorf("%s: %w", sqlStmt, err)
+	}
+
+	myuserinfo, found := userinfocache.Get(mycli.token)
+	if found {
+		v := updateUserInfo(myuserinfo, "Qrcode", base64qrcode)
+		userinfocache.Set(mycli.token, v, cache.NoExpiration)
+		log.Info().Str("qrcode", base64qrcode).Msg("update cache userinfo with qr code")
+	}
+	return true, nil
+}
+
+func (mycli *MyClient) markQRTimeout(kill chan bool) (qrTimeoutResult, error) {
+	if mycli == nil || mycli.db == nil {
+		return qrTimeoutIgnored, errors.New("missing client or database for qr timeout")
+	}
+
+	unlock, current := mycli.lockCurrentQRSession(kill)
+	if !current {
+		return qrTimeoutStaleSession, nil
+	}
+	defer unlock()
+	if mycli.qrPairState != qrPairPending {
+		return qrTimeoutIgnored, nil
+	}
+
+	sqlStmt := `UPDATE users SET qrcode='', connected=0 WHERE id=$1`
+	if _, err := mycli.db.Exec(sqlStmt, mycli.userID); err != nil {
+		return qrTimeoutIgnored, fmt.Errorf("%s: %w", sqlStmt, err)
+	}
+	mycli.qrPairState = qrPairTimedOut
+	mycli.updateCachedPairingState("")
+	return qrTimeoutApplied, nil
 }
 
 // ensureS3ClientForUser loads S3 config from DB and initializes client if not already present (lazy init for reconnect-after-restart)
@@ -433,6 +616,7 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 	} else {
 		client = whatsmeow.NewClient(deviceStore, nil)
 	}
+	configureQRClientType(client)
 
 	// Now we can use the client with the manager
 	clientManager.SetWhatsmeowClient(userID, client)
@@ -447,6 +631,7 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 		token:          token,
 		db:             s.db,
 		s:              s,
+		loginKill:      kill,
 	}
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
@@ -517,10 +702,13 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 				return
 			}
 
-			myuserinfo, found := userinfocache.Get(token)
-
+		qrLoop:
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					if mycli.hasPairSuccess() {
+						log.Info().Str("userid", userID).Msg("Ignoring QR code after pair success")
+						continue
+					}
 					// Display QR code in terminal (useful for testing/developing)
 					// Skip in stdio mode to avoid breaking JSON-RPC
 					if *logType != "json" && s.mode != Stdio {
@@ -530,67 +718,68 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 					// Store encoded/embeded base64 QR on database for retrieval with the /qr endpoint
 					image, _ := qrcode.Encode(evt.Code, qrcode.Medium, 256)
 					base64qrcode := "data:image/png;base64," + base64.StdEncoding.EncodeToString(image)
-					sqlStmt := `UPDATE users SET qrcode=$1 WHERE id=$2`
-					_, err := s.db.Exec(sqlStmt, base64qrcode, userID)
+					stored, err := mycli.storeQRCode(base64qrcode)
 					if err != nil {
-						log.Error().Err(err).Msg(sqlStmt)
+						log.Error().Err(err).Msg("failed to store QR code")
+					} else if !stored {
+						log.Info().Str("userid", userID).Msg("Ignoring stale QR code after pair success")
 					} else {
-						if found {
-							v := updateUserInfo(myuserinfo, "Qrcode", base64qrcode)
-							userinfocache.Set(token, v, cache.NoExpiration)
-							log.Info().Str("qrcode", base64qrcode).Msg("update cache userinfo with qr code")
+						if !mycli.isQRPending() {
+							log.Info().Str("userid", userID).Msg("Skipping QR webhook after pairing state changed")
+							continue
 						}
+						//send QR code with webhook
+						postmap := make(map[string]interface{})
+						postmap["event"] = evt.Event
+						postmap["qrCodeBase64"] = base64qrcode
+						postmap["type"] = "QR"
+						sendEventWithWebHook(&mycli, postmap, "")
 					}
-
-					//send QR code with webhook
-					postmap := make(map[string]interface{})
-					postmap["event"] = evt.Event
-					postmap["qrCodeBase64"] = base64qrcode
-					postmap["type"] = "QR"
-
-					sendEventWithWebHook(&mycli, postmap, "")
 
 				} else if evt.Event == "timeout" {
-					if !ownsLoginSession(userID, kill, "QRTimeout") {
+					if mycli.hasPairSuccess() {
+						log.Info().Str("userid", userID).Msg("Ignoring QR timeout after pair success")
+						break qrLoop
+					}
+					timeoutResult, err := mycli.markQRTimeout(kill)
+					if err != nil {
+						log.Error().Err(err).Msg("failed to mark QR timeout")
+					}
+					if timeoutResult == qrTimeoutStaleSession {
+						log.Info().Str("userid", userID).Msg("Stopping stale QR timeout session after replacement")
+						client.Disconnect()
+						clientManager.DeleteSessionIfCurrent(userID, client, &mycli, httpClient)
+						deleteKillChannel(userID, kill)
 						return
 					}
-
-					// Clear QR code from DB on timeout
-					// Send webhook notifying QR timeout before cleanup
-					postmap := make(map[string]interface{})
-					postmap["event"] = evt.Event
-					postmap["type"] = "QRTimeout"
-					sendEventWithWebHook(&mycli, postmap, "")
-
-					sqlStmt := `UPDATE users SET qrcode='', connected=0 WHERE id=$1`
-					_, err := s.db.Exec(sqlStmt, userID)
-					if err != nil {
-						log.Error().Err(err).Msg(sqlStmt)
-					} else {
-						if found {
-							v := updateUserInfo(myuserinfo, "Qrcode", "")
-							userinfocache.Set(token, v, cache.NoExpiration)
-						}
+					if timeoutResult != qrTimeoutApplied {
+						log.Info().Str("userid", userID).Msg("Ignoring stale QR timeout after pair success")
+						break qrLoop
+					}
+					if !ownsLoginSession(userID, kill, "QRTimeoutCleanup") {
+						log.Info().Str("userid", userID).Msg("Stopping QR timeout cleanup after session replacement")
+						client.Disconnect()
+						clientManager.DeleteSessionIfCurrent(userID, client, &mycli, httpClient)
+						deleteKillChannel(userID, kill)
+						return
+					}
+					{
+						// Send webhook notifying QR timeout before cleanup
+						postmap := make(map[string]interface{})
+						postmap["event"] = evt.Event
+						postmap["type"] = "QRTimeout"
+						sendEventWithWebHook(&mycli, postmap, "")
 					}
 					log.Warn().Msg("QR timeout cleaning current login session")
 					client.Disconnect()
-					clientManager.DeleteWhatsmeowClient(userID)
-					clientManager.DeleteMyClient(userID)
-					clientManager.DeleteHTTPClient(userID)
+					clientManager.DeleteSessionIfCurrent(userID, client, &mycli, httpClient)
 					deleteKillChannel(userID, kill)
 					return
 				} else if evt.Event == "success" {
 					log.Info().Msg("QR pairing ok!")
 					// Clear QR code after pairing
-					sqlStmt := `UPDATE users SET qrcode='', connected=1 WHERE id=$1`
-					_, err := s.db.Exec(sqlStmt, userID)
-					if err != nil {
-						log.Error().Err(err).Msg(sqlStmt)
-					} else {
-						if found {
-							v := updateUserInfo(myuserinfo, "Qrcode", "")
-							userinfocache.Set(token, v, cache.NoExpiration)
-						}
+					if err := mycli.markQRChannelSuccess(); err != nil {
+						log.Error().Err(err).Msg("failed to mark QR pairing success")
 					}
 					break
 				} else {
@@ -677,7 +866,7 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 	clientManager.DeleteWhatsmeowClient(userID)
 	clientManager.DeleteMyClient(userID)
 	clientManager.DeleteHTTPClient(userID)
-	if _, err := s.db.Exec(`UPDATE users SET qrcode='', connected=0 WHERE id=$1`, userID); err != nil {
+	if err := s.setDisconnectedState(userID, false); err != nil {
 		log.Error().Err(err).Msg("failed to mark user disconnected on kill")
 	}
 	deleteKillChannel(userID, kill)
@@ -732,33 +921,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.PairSuccess:
 		log.Info().Str("userid", mycli.userID).Str("token", mycli.token).Str("ID", evt.ID.String()).Str("BusinessName", evt.BusinessName).Str("Platform", evt.Platform).Msg("QR Pair Success")
 		jid := evt.ID
-		sqlStmt := `UPDATE users SET jid=$1 WHERE id=$2`
-		_, err := mycli.db.Exec(sqlStmt, jid, mycli.userID)
+		paired, err := mycli.markPairSuccess(jid)
 		if err != nil {
-			log.Error().Err(err).Msg(sqlStmt)
+			log.Error().Err(err).Msg("failed to mark pair success")
+			return
+		}
+		if !paired {
+			log.Info().Str("userid", mycli.userID).Str("jid", jid.String()).Msg("Ignoring pair success after QR timeout")
 			return
 		}
 
 		postmap["type"] = "PairSuccess"
 		dowebhook = 1
 
-		myuserinfo, found := userinfocache.Get(mycli.token)
-		if !found {
-			log.Warn().Msg("No user info cached on pairing?")
-		} else {
-			txtid = myuserinfo.(Values).Get("Id")
-			token := myuserinfo.(Values).Get("Token")
-			v := updateUserInfo(myuserinfo, "Jid", fmt.Sprintf("%s", jid))
-			userinfocache.Set(token, v, cache.NoExpiration)
-			log.Info().Str("jid", jid.String()).Str("userid", txtid).Str("token", token).Msg("User information set")
-		}
-
 		// Check if automatic history sync is enabled and trigger it after QR code is scanned
 		var daysToSyncHistory int
 		query := "SELECT COALESCE(days_to_sync_history, 0) FROM users WHERE id=$1"
 		query = mycli.db.Rebind(query)
-		err = mycli.db.Get(&daysToSyncHistory, query, mycli.userID)
-		if err != nil {
+		if err := mycli.db.Get(&daysToSyncHistory, query, mycli.userID); err != nil {
 			log.Warn().Err(err).Str("userID", mycli.userID).Msg("Failed to get days_to_sync_history from database")
 		} else if daysToSyncHistory > 0 {
 			// Trigger history sync in a goroutine to avoid blocking
