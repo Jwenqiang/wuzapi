@@ -319,6 +319,34 @@ func TestPairPhoneStartsFreshSessionBeforeCreatingLinkingCode(t *testing.T) {
 	}
 }
 
+func TestPairPhoneRejectsStoredAuthorizedSessionWithoutRebuilding(t *testing.T) {
+	const (
+		userID = "pair-phone-authorized-session-user"
+		token  = "pair-phone-authorized-session-token"
+	)
+	s := makeTestServer(t)
+	seedSessionQRCode(t, s, userID, "")
+	if _, err := s.db.Exec(`UPDATE users SET jid=$1, connected=1 WHERE id=$2`, "8610000000000@s.whatsapp.net", userID); err != nil {
+		t.Fatalf("seed authorized session: %v", err)
+	}
+	s.startQRLogin = func(string, string, chan bool, chan<- *MyClient) {
+		t.Fatal("authorized session started a replacement QR login")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/session/pairphone", strings.NewReader(`{"Phone":"8610000000000"}`))
+	ctx := context.WithValue(req.Context(), "userinfo", Values{map[string]string{
+		"Id":    userID,
+		"Jid":   "",
+		"Token": token,
+	}})
+	recorder := httptest.NewRecorder()
+	s.PairPhone().ServeHTTP(recorder, req.WithContext(ctx))
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("PairPhone status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func seedSessionQRCode(t *testing.T, s *server, userID, code string) {
 	t.Helper()
 	if _, err := s.db.Exec(
