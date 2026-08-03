@@ -718,6 +718,9 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 
 		qrLoop:
 			for evt := range qrChan {
+				if lifecycleEvent := qrLifecycleEventName(evt.Event); lifecycleEvent != "" {
+					logQRLifecycleEvent(lifecycleEvent)
+				}
 				if evt.Event == "code" {
 					if mycli.hasPairSuccess() {
 						log.Info().Str("userid", userID).Msg("Ignoring QR code after pair success")
@@ -933,7 +936,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			return
 		}
 	case *events.PairSuccess:
-		log.Info().Str("userid", mycli.userID).Str("token", mycli.token).Str("ID", evt.ID.String()).Str("BusinessName", evt.BusinessName).Str("Platform", evt.Platform).Msg("QR Pair Success")
+		logQRLifecycleEvent("pair_success")
 		jid := evt.ID
 		paired, err := mycli.markPairSuccess(jid)
 		if err != nil {
@@ -941,7 +944,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			return
 		}
 		if !paired {
-			log.Info().Str("userid", mycli.userID).Str("jid", jid.String()).Msg("Ignoring pair success after QR timeout")
+			log.Info().Msg("Ignoring pair success after QR timeout")
 			return
 		}
 
@@ -1716,6 +1719,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		dowebhook = 1
 		log.Warn().Msg("Keep alive timeout")
 	case *events.ClientOutdated:
+		logQRLifecycleEvent("client_outdated")
 		postmap["type"] = "ClientOutdated"
 		dowebhook = 1
 		log.Warn().Msg("Client outdated")
@@ -1728,6 +1732,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		dowebhook = 1
 		log.Error().Str("code", evt.Code).Msg("Stream error")
 	case *events.PairError:
+		logQRLifecycleEvent("pair_error")
 		postmap["type"] = "PairError"
 		dowebhook = 1
 		log.Error().Msg("Pair error")
