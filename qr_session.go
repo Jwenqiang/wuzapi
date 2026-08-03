@@ -5,8 +5,10 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/patrickmn/go-cache"
+	"go.mau.fi/whatsmeow"
 )
 
 var (
@@ -17,6 +19,10 @@ var (
 )
 
 type qrLoginStarter func(userID, token string, kill chan bool, ready chan<- *MyClient)
+
+type phonePairer func(context.Context, *MyClient, string) (string, error)
+
+const phonePairWaitTimeout = 30 * time.Second
 
 // qrSessionState records the result of the current unauthenticated QR login
 // session. The first terminal event wins: a QR code is persisted successfully,
@@ -164,4 +170,28 @@ func (s *server) startFreshQRLogin(ctx context.Context, userID, jid, token strin
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func defaultPhonePairer(ctx context.Context, mycli *MyClient, phone string) (string, error) {
+	if mycli == nil || mycli.WAClient == nil {
+		return "", errQRSessionUnavailable
+	}
+	return mycli.WAClient.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+}
+
+func (s *server) preparePhonePairing(ctx context.Context, mycli *MyClient, phone string) (string, error) {
+	if s == nil || mycli == nil {
+		return "", errQRSessionUnavailable
+	}
+	pairCtx, cancel := context.WithTimeout(ctx, phonePairWaitTimeout)
+	defer cancel()
+	if err := mycli.qrSession.waitForFirstCode(pairCtx); err != nil {
+		return "", err
+	}
+
+	pairer := s.phonePairer
+	if pairer == nil {
+		pairer = defaultPhonePairer
+	}
+	return pairer(pairCtx, mycli, phone)
 }

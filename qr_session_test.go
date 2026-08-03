@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -141,6 +145,136 @@ func TestStartFreshQRLoginClearsOldCodeAndReplacesPreviousSession(t *testing.T) 
 	}
 	if err := oldState.waitForFirstCode(context.Background()); !errors.Is(err, errQRSessionReplaced) {
 		t.Fatalf("old session wait error = %v; want replacement", err)
+	}
+}
+
+func TestPreparePhonePairingWaitsForFreshQRCode(t *testing.T) {
+	s := makeTestServer(t)
+	state := newQRSessionState()
+	mycli := &MyClient{userID: "phone-pair-wait-user", qrSession: state}
+	called := false
+	s.phonePairer = func(context.Context, *MyClient, string) (string, error) {
+		called = true
+		return "ABCD-EFGH", nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	_, err := s.preparePhonePairing(ctx, mycli, "8610000000000")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("preparePhonePairing() error = %v; want deadline exceeded", err)
+	}
+	if called {
+		t.Fatal("PairPhone was called before a fresh QR code was ready")
+	}
+}
+
+func TestPreparePhonePairingReturnsLinkingCodeAfterFreshQRCode(t *testing.T) {
+	s := makeTestServer(t)
+	state := newQRSessionState()
+	state.markFirstCodeReady()
+	mycli := &MyClient{userID: "phone-pair-ready-user", qrSession: state}
+	called := false
+	s.phonePairer = func(_ context.Context, gotClient *MyClient, gotPhone string) (string, error) {
+		called = true
+		if gotClient != mycli {
+			t.Fatal("phone pairer received a different client")
+		}
+		if gotPhone != "8610000000000" {
+			t.Fatalf("phone pairer phone = %q; want normalized input", gotPhone)
+		}
+		return "ABCD-EFGH", nil
+	}
+
+	got, err := s.preparePhonePairing(context.Background(), mycli, "8610000000000")
+	if err != nil {
+		t.Fatalf("preparePhonePairing() error = %v", err)
+	}
+	if !called {
+		t.Fatal("PairPhone was not called after the fresh QR code became ready")
+	}
+	if got != "ABCD-EFGH" {
+		t.Fatalf("preparePhonePairing() = %q; want linking code", got)
+	}
+}
+
+func TestPreparePhonePairingSkipsRequestAfterQRSessionFailure(t *testing.T) {
+	s := makeTestServer(t)
+	state := newQRSessionState()
+	state.markFailed(errQRSessionTimedOut)
+	mycli := &MyClient{userID: "phone-pair-failed-user", qrSession: state}
+	called := false
+	s.phonePairer = func(context.Context, *MyClient, string) (string, error) {
+		called = true
+		return "", nil
+	}
+
+	_, err := s.preparePhonePairing(context.Background(), mycli, "8610000000000")
+	if !errors.Is(err, errQRSessionTimedOut) {
+		t.Fatalf("preparePhonePairing() error = %v; want QR timeout", err)
+	}
+	if called {
+		t.Fatal("PairPhone was called after the QR session failed")
+	}
+}
+
+func TestPairPhoneStartsFreshSessionBeforeCreatingLinkingCode(t *testing.T) {
+	const (
+		userID = "pair-phone-fresh-session-user"
+		token  = "pair-phone-fresh-session-token"
+	)
+	s := makeTestServer(t)
+	seedSessionQRCode(t, s, userID, "persisted-old-code")
+	t.Cleanup(func() {
+		clientManager.DeleteWhatsmeowClient(userID)
+		clientManager.DeleteMyClient(userID)
+		clientManager.DeleteHTTPClient(userID)
+	})
+
+	state := newQRSessionState()
+	state.markFirstCodeReady()
+	freshClient := &MyClient{userID: userID, db: s.db, qrSession: state}
+	started := false
+	s.startQRLogin = func(gotUserID, gotToken string, kill chan bool, ready chan<- *MyClient) {
+		started = true
+		if gotUserID != userID || gotToken != token {
+			t.Fatalf("fresh login got user=%q token=%q", gotUserID, gotToken)
+		}
+		ready <- freshClient
+	}
+	s.phonePairer = func(_ context.Context, gotClient *MyClient, gotPhone string) (string, error) {
+		if !started {
+			t.Fatal("PairPhone ran before the fresh session was started")
+		}
+		if gotClient != freshClient || gotPhone != "8610000000000" {
+			t.Fatalf("unexpected pairing request client=%p phone=%q", gotClient, gotPhone)
+		}
+		return "ABCD-EFGH", nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/session/pairphone", strings.NewReader(`{"Phone":"8610000000000"}`))
+	ctx := context.WithValue(req.Context(), "userinfo", Values{map[string]string{
+		"Id":    userID,
+		"Jid":   "",
+		"Token": token,
+	}})
+	req = req.WithContext(ctx)
+	recorder := httptest.NewRecorder()
+
+	s.PairPhone().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PairPhone status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Data struct {
+			LinkingCode string `json:"LinkingCode"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode PairPhone response: %v", err)
+	}
+	if response.Data.LinkingCode != "ABCD-EFGH" {
+		t.Fatalf("PairPhone LinkingCode = %q", response.Data.LinkingCode)
 	}
 }
 

@@ -42,6 +42,7 @@ type server struct {
 	exPath       string
 	mode         ServerMode
 	startQRLogin qrLoginStarter
+	phonePairer  phonePairer
 }
 
 // Replace the global variables

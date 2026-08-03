@@ -737,11 +737,8 @@ func (s *server) PairPhone() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-
-		if clientManager.GetWhatsmeowClient(txtid) == nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
-			return
-		}
+		jid := r.Context().Value("userinfo").(Values).Get("Jid")
+		token := r.Context().Value("userinfo").(Values).Get("Token")
 
 		decoder := json.NewDecoder(r.Body)
 		var t pairStruct
@@ -756,17 +753,37 @@ func (s *server) PairPhone() http.HandlerFunc {
 			return
 		}
 
-		isLoggedIn := clientManager.GetWhatsmeowClient(txtid).IsLoggedIn()
-		if isLoggedIn {
-			log.Error().Msg(fmt.Sprintf("%s", "already paired"))
+		if waClient := clientManager.GetWhatsmeowClient(txtid); waClient != nil && waClient.IsLoggedIn() {
+			log.Info().Str("instance", txtid).Msg("Ignoring phone pairing for an authorized session")
 			s.Respond(w, r, http.StatusBadRequest, errors.New("already paired"))
 			return
 		}
 
-		linkingCode, err := clientManager.GetWhatsmeowClient(txtid).PairPhone(context.Background(), t.Phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		pairCtx, cancel := context.WithTimeout(r.Context(), phonePairWaitTimeout)
+		defer cancel()
+		mycli, err := s.startFreshQRLogin(pairCtx, txtid, jid, token)
 		if err != nil {
-			log.Error().Msg(fmt.Sprintf("%s", err))
-			s.Respond(w, r, http.StatusBadRequest, err)
+			if errors.Is(err, errQRSessionAuthorized) {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("already paired"))
+				return
+			}
+			log.Warn().Str("instance", txtid).Msg("Unable to start a fresh QR session for phone pairing")
+			s.Respond(w, r, http.StatusServiceUnavailable, errors.New("QR code is not ready"))
+			return
+		}
+
+		linkingCode, err := s.preparePhonePairing(pairCtx, mycli, t.Phone)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) ||
+				errors.Is(err, errQRSessionTimedOut) ||
+				errors.Is(err, errQRSessionUnavailable) ||
+				errors.Is(err, errQRSessionReplaced) {
+				log.Warn().Str("instance", txtid).Msg("QR code did not become ready for phone pairing")
+				s.Respond(w, r, http.StatusServiceUnavailable, errors.New("QR code is not ready"))
+				return
+			}
+			log.Warn().Str("instance", txtid).Msg("Failed to create phone pairing code")
+			s.Respond(w, r, http.StatusBadRequest, errors.New("failed to create linking code"))
 			return
 		}
 
