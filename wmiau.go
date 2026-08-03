@@ -632,6 +632,10 @@ func getPlatformTypeEnum(platformType string) *waCompanionReg.DeviceProps_Platfo
 }
 
 func (s *server) startClient(userID string, textjid string, token string, kill chan bool) {
+	s.startClientWithReady(userID, textjid, token, kill, nil)
+}
+
+func (s *server) startClientWithReady(userID string, textjid string, token string, kill chan bool, ready chan<- *MyClient) {
 	log.Info().Str("userid", userID).Str("jid", textjid).Msg("Starting websocket connection to Whatsapp")
 
 	// Connection retry constants
@@ -690,6 +694,9 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 
 	// Store the MyClient in clientManager
 	clientManager.SetMyClient(userID, &mycli)
+	if ready != nil {
+		ready <- &mycli
+	}
 
 	httpClient := newWebhookHTTPClient()
 

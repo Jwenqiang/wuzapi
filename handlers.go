@@ -629,53 +629,46 @@ func (s *server) SetWebhook() http.HandlerFunc {
 	}
 }
 
+const qrFirstCodeWaitTimeout = 30 * time.Second
+
 // Gets QR code encoded in Base64
 func (s *server) GetQR() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		code := ""
 		jid := r.Context().Value("userinfo").(Values).Get("Jid")
 
-		if clientManager.GetWhatsmeowClient(txtid) == nil {
+		waClient := clientManager.GetWhatsmeowClient(txtid)
+		if waClient == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
 			return
-		} else {
-			if clientManager.GetWhatsmeowClient(txtid).IsConnected() == false {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New("not connected"))
-				return
-			}
-			rows, err := s.db.Query("SELECT qrcode AS code, COALESCE(jid, '') AS jid FROM users WHERE id=$1 LIMIT 1", txtid)
+		}
+		if !waClient.IsConnected() {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("not connected"))
+			return
+		}
+		if waClient.IsLoggedIn() {
+			response := map[string]interface{}{"QRCode": "", "LoggedIn": true, "JID": jid}
+			responseJSON, err := json.Marshal(response)
 			if err != nil {
 				s.Respond(w, r, http.StatusInternalServerError, err)
-				return
+			} else {
+				s.Respond(w, r, http.StatusOK, string(responseJSON))
 			}
-			defer rows.Close()
-			for rows.Next() {
-				err = rows.Scan(&code, &jid)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, err)
-					return
-				}
-			}
-			err = rows.Err()
-			if err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, err)
-				return
-			}
-			if clientManager.GetWhatsmeowClient(txtid).IsLoggedIn() == true {
-				response := map[string]interface{}{"QRCode": "", "LoggedIn": true, "JID": jid}
-				responseJson, err := json.Marshal(response)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, err)
-				} else {
-					s.Respond(w, r, http.StatusOK, string(responseJson))
-				}
-				return
-			}
+			return
 		}
 
-		log.Info().Str("instance", txtid).Str("qrcode", code).Msg("Get QR successful")
+		mycli := clientManager.GetMyClient(txtid)
+		ctx, cancel := context.WithTimeout(r.Context(), qrFirstCodeWaitTimeout)
+		defer cancel()
+		code, err := s.getCurrentSessionQRCode(ctx, mycli)
+		if err != nil {
+			log.Warn().Str("instance", txtid).Msg("QR code is not ready for the current session")
+			s.Respond(w, r, http.StatusServiceUnavailable, errors.New("QR code is not ready"))
+			return
+		}
+
+		log.Info().Str("instance", txtid).Msg("Get QR successful")
 		response := map[string]interface{}{"QRCode": fmt.Sprintf("%s", code)}
 		responseJson, err := json.Marshal(response)
 		if err != nil {

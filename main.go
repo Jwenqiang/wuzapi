@@ -37,10 +37,11 @@ const (
 )
 
 type server struct {
-	db     *sqlx.DB
-	router *mux.Router
-	exPath string
-	mode   ServerMode
+	db           *sqlx.DB
+	router       *mux.Router
+	exPath       string
+	mode         ServerMode
+	startQRLogin qrLoginStarter
 }
 
 // Replace the global variables
