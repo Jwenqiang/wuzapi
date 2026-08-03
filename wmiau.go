@@ -421,6 +421,55 @@ func checkIfSubscribedToEvent(subscribedEvents []string, eventType string, userI
 	return true
 }
 
+func newWebhookHTTPClient() *resty.Client {
+	httpClient := resty.New()
+	httpClient.RemoveProxy()
+	httpClient.SetRedirectPolicy(resty.FlexibleRedirectPolicy(15))
+	if *waDebug == "DEBUG" {
+		httpClient.SetDebug(true)
+	}
+	httpClient.SetTimeout(30 * time.Second)
+	httpClient.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
+	httpClient.OnError(func(req *resty.Request, err error) {
+		if v, ok := err.(*resty.ResponseError); ok {
+			// v.Response contains the last response from the server
+			// v.Err contains the original error
+			log.Debug().Str("response", v.Response.String()).Msg("resty error")
+			log.Error().Err(v.Err).Msg("resty error")
+		}
+	})
+	return httpClient
+}
+
+type whatsAppProxyConfigurer interface {
+	SetSOCKSProxy(proxy.Dialer, ...whatsmeow.SetProxyOptions)
+	SetProxyAddress(string, ...whatsmeow.SetProxyOptions) error
+}
+
+func configureWhatsAppProxy(client whatsAppProxyConfigurer, proxyURL string) {
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		log.Warn().Err(err).Str("proxy", proxyURL).Msg("Invalid proxy URL, skipping proxy setup")
+		return
+	}
+
+	log.Info().Str("proxy", proxyURL).Msg("Configuring proxy")
+
+	if parsed.Scheme == "socks5" || parsed.Scheme == "socks5h" {
+		dialer, err := proxy.FromURL(parsed, nil)
+		if err != nil {
+			log.Warn().Err(err).Str("proxy", proxyURL).Msg("Failed to build SOCKS proxy dialer, skipping proxy setup")
+			return
+		}
+		client.SetSOCKSProxy(dialer, whatsmeow.SetProxyOptions{})
+		log.Info().Msg("SOCKS proxy configured successfully")
+		return
+	}
+
+	client.SetProxyAddress(parsed.String(), whatsmeow.SetProxyOptions{})
+	log.Info().Msg("HTTP/HTTPS proxy configured successfully")
+}
+
 // Connects to Whatsapp Websocket on server startup if last state was connected
 func (s *server) connectOnStartup() {
 	rows, err := s.db.Queryx("SELECT id,name,token,jid,webhook,events,proxy_url,CASE WHEN s3_enabled THEN 'true' ELSE 'false' END AS s3_enabled,media_delivery,COALESCE(history, 0) as history,hmac_key FROM users WHERE connected=1")
@@ -638,48 +687,13 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 	// Store the MyClient in clientManager
 	clientManager.SetMyClient(userID, &mycli)
 
-	httpClient := resty.New()
-	httpClient.SetRedirectPolicy(resty.FlexibleRedirectPolicy(15))
-	if *waDebug == "DEBUG" {
-		httpClient.SetDebug(true)
-	}
-	httpClient.SetTimeout(30 * time.Second)
-	httpClient.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
-	httpClient.OnError(func(req *resty.Request, err error) {
-		if v, ok := err.(*resty.ResponseError); ok {
-			// v.Response contains the last response from the server
-			// v.Err contains the original error
-			log.Debug().Str("response", v.Response.String()).Msg("resty error")
-			log.Error().Err(v.Err).Msg("resty error")
-		}
-	})
+	httpClient := newWebhookHTTPClient()
 
 	// Set proxy if defined in DB (assumes users table contains proxy_url column)
 	var proxyURL string
 	err = s.db.Get(&proxyURL, "SELECT proxy_url FROM users WHERE id=$1", userID)
 	if err == nil && proxyURL != "" {
-		parsed, perr := url.Parse(proxyURL)
-		if perr != nil {
-			log.Warn().Err(perr).Str("proxy", proxyURL).Msg("Invalid proxy URL, skipping proxy setup")
-		} else {
-
-			log.Info().Str("proxy", proxyURL).Msg("Configuring proxy")
-
-			if parsed.Scheme == "socks5" || parsed.Scheme == "socks5h" {
-				dialer, derr := proxy.FromURL(parsed, nil)
-				if derr != nil {
-					log.Warn().Err(derr).Str("proxy", proxyURL).Msg("Failed to build SOCKS proxy dialer, skipping proxy setup")
-				} else {
-					httpClient.SetProxy(proxyURL)
-					client.SetSOCKSProxy(dialer, whatsmeow.SetProxyOptions{})
-					log.Info().Msg("SOCKS proxy configured successfully")
-				}
-			} else {
-				httpClient.SetProxy(proxyURL)
-				client.SetProxyAddress(parsed.String(), whatsmeow.SetProxyOptions{})
-				log.Info().Msg("HTTP/HTTPS proxy configured successfully")
-			}
-		}
+		configureWhatsAppProxy(client, proxyURL)
 	}
 	clientManager.SetHTTPClient(userID, httpClient)
 
