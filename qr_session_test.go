@@ -148,6 +148,47 @@ func TestStartFreshQRLoginClearsOldCodeAndReplacesPreviousSession(t *testing.T) 
 	}
 }
 
+func TestStartFreshQRLoginPreservesPreviousSessionWhenQRCodeClearFails(t *testing.T) {
+	const (
+		userID = "fresh-qr-login-clear-failure-user"
+		token  = "fresh-qr-login-clear-failure-token"
+	)
+	s := makeTestServer(t)
+	seedSessionQRCode(t, s, userID, "persisted-old-code")
+	if _, err := s.db.Exec(`
+		CREATE TRIGGER reject_qr_clear
+		BEFORE UPDATE OF qrcode ON users
+		WHEN NEW.qrcode = ''
+		BEGIN
+			SELECT RAISE(FAIL, 'reject QR clear');
+		END`); err != nil {
+		t.Fatalf("create QR clear failure trigger: %v", err)
+	}
+
+	oldState := newQRSessionState()
+	oldClient := &MyClient{userID: userID, db: s.db, qrSession: oldState}
+	oldKill := make(chan bool, 1)
+	clientManager.SetMyClient(userID, oldClient)
+	setKillChannel(userID, oldKill)
+	t.Cleanup(func() {
+		clientManager.DeleteMyClient(userID)
+		deleteKillChannel(userID, oldKill)
+	})
+
+	_, err := s.startFreshQRLogin(context.Background(), userID, "", token)
+	if err == nil {
+		t.Fatal("startFreshQRLogin() unexpectedly succeeded when QR clear failed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if err := oldState.waitForFirstCode(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("old session was replaced after QR clear failure: %v", err)
+	}
+	if currentKill, ok := getKillChannel(userID); !ok || currentKill != oldKill {
+		t.Fatal("QR clear failure replaced the previous session kill channel")
+	}
+}
+
 func TestPreparePhonePairingWaitsForFreshQRCode(t *testing.T) {
 	s := makeTestServer(t)
 	state := newQRSessionState()

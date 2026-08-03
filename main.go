@@ -43,6 +43,7 @@ type server struct {
 	mode         ServerMode
 	startQRLogin qrLoginStarter
 	phonePairer  phonePairer
+	qrLoginMu    sync.Mutex
 }
 
 // Replace the global variables

@@ -117,6 +117,8 @@ func (s *server) startFreshQRLogin(ctx context.Context, userID, jid, token strin
 	if s == nil || s.db == nil {
 		return nil, errQRSessionUnavailable
 	}
+	s.qrLoginMu.Lock()
+	defer s.qrLoginMu.Unlock()
 	if strings.TrimSpace(jid) != "" {
 		return nil, errQRSessionAuthorized
 	}
@@ -130,23 +132,32 @@ func (s *server) startFreshQRLogin(ctx context.Context, userID, jid, token strin
 	}
 
 	previous := clientManager.GetMyClient(userID)
-	previousKill, _ := getKillChannel(userID)
+	kill := make(chan bool, 1)
+	killchannelMu.Lock()
+	previousKill := killchannel[userID]
+	killchannel[userID] = kill
+	if _, err := s.db.ExecContext(ctx, `UPDATE users SET qrcode='' WHERE id=$1`, userID); err != nil {
+		if previousKill == nil {
+			delete(killchannel, userID)
+		} else {
+			killchannel[userID] = previousKill
+		}
+		killchannelMu.Unlock()
+		return nil, err
+	}
+	killchannelMu.Unlock()
+	if previousKill == nil && previous != nil {
+		previousKill = previous.loginKill
+	}
+	if userinfo, found := userinfocache.Get(token); found {
+		userinfocache.Set(token, updateUserInfo(userinfo, "Qrcode", ""), cache.NoExpiration)
+	}
 	if previous != nil {
 		previous.qrSession.markFailed(errQRSessionReplaced)
 		if previous.WAClient != nil {
 			previous.WAClient.Disconnect()
 		}
 	}
-
-	if _, err := s.db.ExecContext(ctx, `UPDATE users SET qrcode='' WHERE id=$1`, userID); err != nil {
-		return nil, err
-	}
-	if userinfo, found := userinfocache.Get(token); found {
-		userinfocache.Set(token, updateUserInfo(userinfo, "Qrcode", ""), cache.NoExpiration)
-	}
-
-	kill := make(chan bool, 1)
-	setKillChannel(userID, kill)
 	if previousKill != nil {
 		select {
 		case previousKill <- true:
