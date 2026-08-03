@@ -45,6 +45,7 @@ type MyClient struct {
 	loginKill      chan bool
 	qrPairMu       sync.Mutex
 	qrPairState    qrPairState
+	qrSession      *qrSessionState
 }
 
 type qrPairState int
@@ -219,6 +220,7 @@ func (mycli *MyClient) storeQRCode(base64qrcode string) (bool, error) {
 		userinfocache.Set(mycli.token, v, cache.NoExpiration)
 		log.Info().Str("qrcode", base64qrcode).Msg("update cache userinfo with qr code")
 	}
+	mycli.qrSession.markFirstCodeReady()
 	return true, nil
 }
 
@@ -242,6 +244,7 @@ func (mycli *MyClient) markQRTimeout(kill chan bool) (qrTimeoutResult, error) {
 	}
 	mycli.qrPairState = qrPairTimedOut
 	mycli.updateCachedPairingState("")
+	mycli.qrSession.markFailed(errQRSessionTimedOut)
 	return qrTimeoutApplied, nil
 }
 
@@ -681,6 +684,7 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 		db:             s.db,
 		s:              s,
 		loginKill:      kill,
+		qrSession:      newQRSessionState(),
 	}
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
@@ -707,12 +711,14 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 			// This error means that we're already logged in, so ignore it.
 			if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
 				log.Error().Err(err).Msg("Failed to get QR channel")
+				mycli.qrSession.markFailed(err)
 				return
 			}
 		} else {
 			err = client.Connect() // Must connect to generate QR code
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to connect client")
+				mycli.qrSession.markFailed(err)
 				return
 			}
 
